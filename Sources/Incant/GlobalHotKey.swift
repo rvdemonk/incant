@@ -1,80 +1,94 @@
 import Carbon
 import AppKit
 
-/// Global hotkey using Carbon API (works without accessibility permissions)
-final class GlobalHotKey {
-    private static var nextID: UInt32 = 1
+/// Manages global hotkeys using Carbon API
+final class GlobalHotKeyManager {
+    static let shared = GlobalHotKeyManager()
 
-    private var hotKeyRef: EventHotKeyRef?
+    private var hotKeys: [UInt32: () -> Void] = [:]  // id -> callback
+    private var hotKeyRefs: [UInt32: EventHotKeyRef] = [:]
     private var eventHandler: EventHandlerRef?
-    private let callback: () -> Void
-    private let id: UInt32
+    private var nextID: UInt32 = 1
 
-    // Modifier flags for Carbon
-    static let optionKey: UInt32 = UInt32(optionKey)
-    static let commandKey: UInt32 = UInt32(cmdKey)
-    static let controlKey: UInt32 = UInt32(controlKey)
-    static let shiftKey: UInt32 = UInt32(shiftKey)
-
-    init(keyCode: UInt32, modifiers: UInt32, callback: @escaping () -> Void) {
-        self.id = GlobalHotKey.nextID
-        GlobalHotKey.nextID += 1
-        self.callback = callback
-        register(keyCode: keyCode, modifiers: modifiers)
+    private init() {
+        installEventHandler()
     }
 
     deinit {
-        unregister()
+        if let handler = eventHandler {
+            RemoveEventHandler(handler)
+        }
+        for ref in hotKeyRefs.values {
+            UnregisterEventHotKey(ref)
+        }
     }
 
-    private func register(keyCode: UInt32, modifiers: UInt32) {
-        // Store self reference for callback
-        let refcon = UnsafeMutableRawPointer(Unmanaged.passRetained(self).toOpaque())
+    func register(keyCode: UInt32, modifiers: UInt32, callback: @escaping () -> Void) {
+        let id = nextID
+        nextID += 1
 
-        // Set up event handler
+        hotKeys[id] = callback
+
+        var hotKeyRef: EventHotKeyRef?
+        let hotKeyID = EventHotKeyID(signature: OSType(0x494E4354), id: id) // "INCT"
+        let status = RegisterEventHotKey(keyCode, modifiers, hotKeyID, GetApplicationEventTarget(), 0, &hotKeyRef)
+
+        if status == noErr, let ref = hotKeyRef {
+            hotKeyRefs[id] = ref
+        }
+    }
+
+    private func installEventHandler() {
         var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
 
-        let handlerCallback: EventHandlerUPP = { _, event, userData -> OSStatus in
-            guard let userData = userData else { return OSStatus(eventNotHandledErr) }
-            let hotKey = Unmanaged<GlobalHotKey>.fromOpaque(userData).takeUnretainedValue()
-            DispatchQueue.main.async {
-                hotKey.callback()
+        let handler: EventHandlerUPP = { _, event, userData -> OSStatus in
+            guard let event = event, let userData = userData else { return OSStatus(eventNotHandledErr) }
+
+            // Extract hotkey ID from event
+            var hotKeyID = EventHotKeyID()
+            let status = GetEventParameter(
+                event,
+                EventParamName(kEventParamDirectObject),
+                EventParamType(typeEventHotKeyID),
+                nil,
+                MemoryLayout<EventHotKeyID>.size,
+                nil,
+                &hotKeyID
+            )
+
+            guard status == noErr else { return OSStatus(eventNotHandledErr) }
+
+            let manager = Unmanaged<GlobalHotKeyManager>.fromOpaque(userData).takeUnretainedValue()
+            if let callback = manager.hotKeys[hotKeyID.id] {
+                DispatchQueue.main.async {
+                    callback()
+                }
             }
+
             return noErr
         }
 
+        let refcon = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
+
         InstallEventHandler(
             GetApplicationEventTarget(),
-            handlerCallback,
+            handler,
             1,
             &eventType,
             refcon,
             &eventHandler
         )
-
-        // Register the hotkey
-        let hotKeyID = EventHotKeyID(signature: OSType(0x494E4354), id: id) // "INCT"
-        RegisterEventHotKey(keyCode, modifiers, hotKeyID, GetApplicationEventTarget(), 0, &hotKeyRef)
-    }
-
-    private func unregister() {
-        if let ref = hotKeyRef {
-            UnregisterEventHotKey(ref)
-        }
-        if let handler = eventHandler {
-            RemoveEventHandler(handler)
-        }
     }
 }
 
-// Common key codes
-extension GlobalHotKey {
-    // Key code for ` (grave/backtick) - key below Escape
+// Convenience wrapper for cleaner API
+final class GlobalHotKey {
+    // Key codes
     static let kVK_Grave: UInt32 = 0x32
-
-    // Key code for Space
     static let kVK_Space: UInt32 = 0x31
-
-    // Key code for Escape
     static let kVK_Escape: UInt32 = 0x35
+
+    init(keyCode: UInt32, modifiers: UInt32, callback: @escaping () -> Void) {
+        GlobalHotKeyManager.shared.register(keyCode: keyCode, modifiers: modifiers, callback: callback)
+    }
 }
